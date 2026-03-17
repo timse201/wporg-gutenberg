@@ -743,7 +743,11 @@ add_action( 'wp_enqueue_scripts', 'gutenbergtheme_scripts' );
  * Add meta tags for richer social media integrations.
  */
 function add_social_meta_tags() {
-	$post          = get_post();
+	$post = get_post();
+	if ( ! $post ) {
+		return;
+	}
+
 	$excerpt       = get_the_excerpt( $post );
 	$default_image = wp_get_attachment_url( get_post_thumbnail_id( $post->ID ), 'thumbnail' );
 	$site_title    = function_exists( '\WordPressdotorg\site_brand' ) ? \WordPressdotorg\site_brand() : 'WordPress.org';
