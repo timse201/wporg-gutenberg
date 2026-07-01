@@ -1,9 +1,11 @@
 var el = wp.element.createElement,
 	registerBlockType = wp.blocks.registerBlockType,
 	InnerBlocks = wp.blockEditor.InnerBlocks,
+	useBlockProps = wp.blockEditor.useBlockProps,
 	isAdmin = window.location.pathname.includes( 'wp-admin' );
 
 registerBlockType( 'wporg/wporg-gutenberg-button', {
+	apiVersion: 3,
 	title: 'Demo Button',
 	icon: 'button',
 	category: 'layout',
@@ -30,18 +32,20 @@ registerBlockType( 'wporg/wporg-gutenberg-button', {
 	},
 
 	edit( props ) {
+		const blockProps = useBlockProps();
+
 		if ( ! isAdmin ) {
 			const blockEditorData = wp.data.select( 'core/block-editor' );
 			const innerHtml = blockEditorData.getBlock( props.clientId ).innerBlocks[ 0 ].originalContent;
 
 			return el( 'div', {
-				className: props.className,
+				...blockProps,
 				dangerouslySetInnerHTML: { __html: innerHtml },
 			} );
 		}
 		return el(
 			'div',
-			{ className: props.className },
+			blockProps,
 			el( InnerBlocks, {
 				template: [ [ 'core/button' ] ],
 				templateLock: 'all',
@@ -50,6 +54,10 @@ registerBlockType( 'wporg/wporg-gutenberg-button', {
 	},
 
 	save() {
-		return el( 'div', { className: 'wp-block-buttons' }, el( InnerBlocks.Content ) );
+		return el(
+			'div',
+			useBlockProps.save( { className: 'wp-block-buttons' } ),
+			el( InnerBlocks.Content )
+		);
 	},
 } );
