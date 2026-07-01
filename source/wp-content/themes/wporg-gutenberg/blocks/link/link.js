@@ -1,9 +1,11 @@
 var el = wp.element.createElement,
 	registerBlockType = wp.blocks.registerBlockType,
 	InnerBlocks = wp.blockEditor.InnerBlocks,
+	useBlockProps = wp.blockEditor.useBlockProps,
 	isAdmin = window.location.pathname.includes( 'wp-admin' );
 
 registerBlockType( 'wporg/wporg-gutenberg-link', {
+	apiVersion: 3,
 	title: 'Demo Link',
 	description: 'Create a link for the demo page.',
 	icon: 'button',
@@ -14,18 +16,20 @@ registerBlockType( 'wporg/wporg-gutenberg-link', {
 	},
 
 	edit( props ) {
+		const blockProps = useBlockProps();
+
 		if ( ! isAdmin ) {
 			const blockEditorData = wp.data.select( 'core/block-editor' );
 			const innerHtml = blockEditorData.getBlock( props.clientId ).innerBlocks[ 0 ].originalContent;
 
 			return el( 'div', {
-				className: props.className,
+				...blockProps,
 				dangerouslySetInnerHTML: { __html: innerHtml },
 			} );
 		}
 		return el(
 			'div',
-			{ className: props.className },
+			blockProps,
 			el( InnerBlocks, {
 				template: [ [ 'core/paragraph' ] ],
 				templateLock: 'all',
@@ -34,6 +38,6 @@ registerBlockType( 'wporg/wporg-gutenberg-link', {
 	},
 
 	save() {
-		return el( 'div', {}, el( InnerBlocks.Content ) );
+		return el( 'div', useBlockProps.save(), el( InnerBlocks.Content ) );
 	},
 } );
