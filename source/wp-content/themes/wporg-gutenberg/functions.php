@@ -76,16 +76,34 @@ if ( ! function_exists( 'gutenberg_editor_scripts_and_styles' ) ) {
 			$post_type_object = get_post_type_object( $post_type );
 			$rest_base        = ! empty( $post_type_object->rest_base ) ? $post_type_object->rest_base : $post_type_object->name;
 
+			/*
+			 * rest_preload_api_request() runs as the logged-out user and keeps only
+			 * 200s, so only publicly-readable paths can be preloaded here. Forbidden
+			 * context=edit responses are supplied by frontenberg_hardcoded_preload_data().
+			 */
 			$preload_paths = array(
-				'/',
-				'/wp/v2/types?context=edit',
-				'/wp/v2/taxonomies?per_page=-1&context=edit',
-				'/wp/v2/themes?status=active',
-				sprintf( '/wp/v2/%s/%s?context=edit', $rest_base, $post->ID ),
-				sprintf( '/wp/v2/types/%s?context=edit', $post_type ),
-				sprintf( '/wp/v2/users/me?post_type=%s&context=edit', $post_type ),
-				array( '/wp/v2/media', 'OPTIONS' ),
-				array( '/wp/v2/blocks', 'OPTIONS' ),
+				'/wp/v2/types?context=view',
+				'/wp/v2/taxonomies?context=view',
+				// The root site entity ("__unstableBase"); see core-data's entities.js.
+				'/?_fields=' . implode(
+					',',
+					array(
+						'description',
+						'gmt_offset',
+						'home',
+						'image_sizes',
+						'image_size_threshold',
+						'name',
+						'site_icon',
+						'site_icon_url',
+						'site_logo',
+						'timezone_string',
+						'url',
+						'page_for_posts',
+						'page_on_front',
+						'show_on_front',
+					)
+				),
 			);
 
 			/**
@@ -117,6 +135,68 @@ if ( ! function_exists( 'gutenberg_editor_scripts_and_styles' ) ) {
 			wp_add_inline_script(
 				'wp-api-fetch',
 				sprintf( 'wp.apiFetch.use( wp.apiFetch.createPreloadingMiddleware( %s ) );', wp_json_encode( $preload_data ) ),
+				'after'
+			);
+
+			/*
+			 * Serve the forbidden context=edit responses via a *persistent* middleware,
+			 * not createPreloadingMiddleware: initializeEditor() calls clearPreloadedData()
+			 * once its preload Promise.all settles, which rejects early for logged-out
+			 * visitors (several resolvers 401) — before the post's getEntityRecord resolver
+			 * (delayed by the entity config + a store lock) fetches. A cleared preload
+			 * entry would be gone by then; this middleware answers for the page's lifetime.
+			 */
+			wp_add_inline_script(
+				'wp-api-fetch',
+				sprintf(
+					'( function () {
+	var responses = %s;
+	var get = null, options_map = null;
+	function build() {
+		var normalize = wp.url.normalizePath;
+		get = {};
+		options_map = {};
+		Object.keys( responses ).forEach( function ( key ) {
+			if ( "OPTIONS" === key ) {
+				Object.keys( responses[ key ] ).forEach( function ( path ) {
+					options_map[ normalize( path ) ] = responses[ key ][ path ];
+				} );
+			} else {
+				get[ normalize( key ) ] = responses[ key ];
+			}
+		} );
+	}
+	function respond( entry, parse ) {
+		if ( false === parse ) {
+			return Promise.resolve(
+				new window.Response( JSON.stringify( entry.body ), {
+					status: 200,
+					statusText: "OK",
+					headers: entry.headers || {},
+				} )
+			);
+		}
+		return Promise.resolve( entry.body );
+	}
+	wp.apiFetch.use( function ( options, next ) {
+		if ( ! get ) {
+			build();
+		}
+		if ( "string" === typeof options.path ) {
+			var method = options.method || "GET";
+			var path = wp.url.normalizePath( options.path );
+			if ( "GET" === method && get[ path ] ) {
+				return respond( get[ path ], options.parse );
+			}
+			if ( "OPTIONS" === method && options_map[ path ] ) {
+				return respond( options_map[ path ], options.parse );
+			}
+		}
+		return next( options );
+	} );
+} )();',
+					wp_json_encode( frontenberg_hardcoded_preload_data( $post ) )
+				),
 				'after'
 			);
 
@@ -240,7 +320,11 @@ if ( ! function_exists( 'gutenberg_editor_scripts_and_styles' ) ) {
 				$active_post_lock = wp_set_post_lock( $post->ID );
 				$lock_details     = array(
 					'isLocked'       => false,
-					'activePostLock' => esc_attr( implode( ':', $active_post_lock ) ),
+					// wp_set_post_lock() returns false when there is no logged-in user
+					// (e.g. a logged-out front-end visitor); cast so implode() does not
+					// fatal on false. On .org the front page is always locked, so this
+					// branch only runs locally.
+					'activePostLock' => esc_attr( implode( ':', (array) $active_post_lock ) ),
 				);
 			}
 
@@ -422,6 +506,215 @@ if ( ! function_exists( 'gutenberg_get_autosave_newer_than_post_save' ) ) {
 	}
 } // /function_exists()
 
+/**
+ * Builds the context=edit preload responses a logged-out visitor cannot fetch
+ * from the REST API (they 401, so rest_preload_api_request() drops them).
+ *
+ * Each entry carries an Allow header: the core-data resolvers derive canUser()
+ * from response.headers.get('allow'), and an all-false result on the post record
+ * is what triggers the "item that doesn't exist" notice.
+ *
+ * @param WP_Post $post The post being edited (the front page).
+ * @return array Preload data keyed by REST path.
+ */
+function frontenberg_hardcoded_preload_data( $post ) {
+	$rest_path = rest_get_route_for_post( $post );
+
+	// Curated demo content, overriding the stored post.
+	$content = include __DIR__ . '/gutenberg-content.php';
+
+	$data = array();
+
+	// status=pending stops the editor offering to save/publish (writes are blocked anyway).
+	$data[ $rest_path . '?context=edit' ] = array(
+		'body'    => array(
+			'id'                 => $post->ID,
+			'title'              => array( 'raw' => $content['title'] ),
+			'content'            => array(
+				'block_format' => 1,
+				'raw'          => $content['content'],
+			),
+			'excerpt'            => array( 'raw' => '' ),
+			'date'               => '',
+			'date_gmt'           => '',
+			'modified'           => '',
+			'modified_gmt'       => '',
+			'link'               => home_url( '/' ),
+			'guid'               => array(),
+			'parent'             => 0,
+			'menu_order'         => 0,
+			'author'             => 0,
+			'featured_media'     => 0,
+			'comment_status'     => 'closed',
+			'ping_status'        => 'closed',
+			'template'           => '',
+			'meta'               => array(),
+			'_links'             => array(),
+			'type'               => $post->post_type,
+			'status'             => 'pending',
+			'slug'               => '',
+			'generated_slug'     => '',
+			'permalink_template' => home_url( '/' ),
+		),
+		'headers' => array(
+			'Allow' => 'GET, POST, PUT, PATCH, DELETE',
+		),
+	);
+
+	// /wp/v2/users/me requires an authenticated user; a generic guest avoids exposing a real account.
+	$guest_user = array(
+		'id'                 => 0,
+		'name'               => __( 'Guest', 'wporg' ),
+		'url'                => '',
+		'description'        => '',
+		'link'               => '',
+		'slug'               => 'guest',
+		'avatar_urls'        => array(),
+		'meta'               => array(),
+		'capabilities'       => array(),
+		'extra_capabilities' => array(),
+	);
+	$user_headers = array( 'Allow' => 'GET, POST, PUT, PATCH, DELETE' );
+
+	$data['/wp/v2/users/me']              = array(
+		'body'    => $guest_user,
+		'headers' => $user_headers,
+	);
+	$data['/wp/v2/users/me?context=edit'] = array(
+		'body'    => $guest_user,
+		'headers' => $user_headers,
+	);
+
+	$read_only = array( 'Allow' => 'GET' );
+
+	/*
+	 * types/page and taxonomies are public in the view context, so reuse those
+	 * bodies. labels are edit-only (the editor reads labels.view_item), so add them.
+	 */
+	$post_type_body           = frontenberg_public_view_response( '/wp/v2/types/' . $post->post_type );
+	$post_type_body['labels'] = get_post_type_labels( get_post_type_object( $post->post_type ) );
+	$data[ '/wp/v2/types/' . $post->post_type . '?context=edit' ] = array(
+		'body'    => $post_type_body,
+		'headers' => $read_only,
+	);
+	$data['/wp/v2/taxonomies?context=edit'] = array(
+		'body'    => frontenberg_public_view_response( '/wp/v2/taxonomies' ),
+		'headers' => $read_only,
+	);
+
+	// Built from options (settings is forbidden in every context); no sensitive values such as admin email.
+	$data['/wp/v2/settings'] = array(
+		'body'    => array(
+			'title'                  => get_option( 'blogname' ),
+			'description'            => get_option( 'blogdescription' ),
+			'url'                    => get_option( 'siteurl' ),
+			'language'               => get_option( 'WPLANG' ) ? get_option( 'WPLANG' ) : 'en_US',
+			'timezone'               => get_option( 'timezone_string' ),
+			'date_format'            => get_option( 'date_format' ),
+			'time_format'            => get_option( 'time_format' ),
+			'start_of_week'          => (int) get_option( 'start_of_week' ),
+			'posts_per_page'         => (int) get_option( 'posts_per_page' ),
+			'show_on_front'          => get_option( 'show_on_front' ),
+			'page_on_front'          => (int) get_option( 'page_on_front' ),
+			'page_for_posts'         => (int) get_option( 'page_for_posts' ),
+			'default_comment_status' => get_option( 'default_comment_status' ),
+			'default_ping_status'    => get_option( 'default_ping_status' ),
+			'site_logo'              => (int) get_theme_mod( 'custom_logo' ),
+			'site_icon'              => (int) get_option( 'site_icon' ),
+		),
+		'headers' => array( 'Allow' => 'GET, POST, PUT, PATCH' ),
+	);
+
+	// The editor reads is_block_theme and theme_supports from this record.
+	$theme = wp_get_theme();
+	$data['/wp/v2/themes?context=edit&status=active'] = array(
+		'body'    => array(
+			array(
+				'stylesheet'     => get_stylesheet(),
+				'template'       => get_template(),
+				'version'        => $theme->get( 'Version' ),
+				'status'         => 'active',
+				'is_block_theme' => wp_is_block_theme(),
+				'name'           => array( 'raw' => $theme->get( 'Name' ), 'rendered' => $theme->get( 'Name' ) ),
+				'theme_supports' => array(
+					'editor-styles'        => current_theme_supports( 'editor-styles' ),
+					'responsive-embeds'    => current_theme_supports( 'responsive-embeds' ),
+					'align-wide'           => current_theme_supports( 'align-wide' ),
+					'html5'                => (array) get_theme_support( 'html5' ),
+					'post-thumbnails'      => (bool) get_theme_support( 'post-thumbnails' ),
+					'automatic-feed-links' => current_theme_supports( 'automatic-feed-links' ),
+				),
+			),
+		),
+		'headers' => $read_only,
+	);
+
+	$data['/wp/v2/block-patterns/categories'] = array(
+		'body'    => array_values( WP_Block_Pattern_Categories_Registry::get_instance()->get_all_registered() ),
+		'headers' => $read_only,
+	);
+
+	// Frontenberg is a post editor, so template lookups and the list can be empty.
+	$data['/wp/v2/templates?context=edit&per_page=10'] = array(
+		'body'    => array(),
+		'headers' => array( 'Allow' => 'GET, POST' ),
+	);
+	$data['/wp/v2/templates/lookup?slug=front-page'] = array(
+		'body'    => (object) array(),
+		'headers' => $read_only,
+	);
+	$data['/wp/v2/templates/lookup?slug=page'] = array(
+		'body'    => (object) array(),
+		'headers' => $read_only,
+	);
+
+	// Theme global styles + variations, rebuilt from theme.json as the core controller does.
+	$stylesheet = get_stylesheet();
+	$theme_json = WP_Theme_JSON_Resolver::get_merged_data( 'theme' );
+	$theme_raw  = $theme_json->get_raw_data();
+
+	$data[ '/wp/v2/global-styles/themes/' . $stylesheet . '?context=view' ] = array(
+		'body'    => array(
+			'settings' => $theme_json->get_settings(),
+			'styles'   => isset( $theme_raw['styles'] ) ? $theme_raw['styles'] : array(),
+		),
+		'headers' => $read_only,
+	);
+	$data[ '/wp/v2/global-styles/themes/' . $stylesheet . '/variations?context=view' ] = array(
+		'body'    => WP_Theme_JSON_Resolver::get_style_variations(),
+		'headers' => $read_only,
+	);
+
+	// canUser() OPTIONS probes; advertising create/update keeps the demo interactive (writes still blocked).
+	$data['OPTIONS'] = array(
+		'/wp/v2/media'     => array( 'body' => array(), 'headers' => array( 'Allow' => 'GET, POST' ) ),
+		'/wp/v2/pages'     => array( 'body' => array(), 'headers' => array( 'Allow' => 'GET, POST' ) ),
+		'/wp/v2/blocks'    => array( 'body' => array(), 'headers' => array( 'Allow' => 'GET, POST' ) ),
+		'/wp/v2/templates' => array( 'body' => array(), 'headers' => array( 'Allow' => 'GET, POST' ) ),
+		'/wp/v2/settings'  => array( 'body' => array(), 'headers' => array( 'Allow' => 'GET, POST, PUT, PATCH' ) ),
+	);
+
+	return $data;
+}
+
+/**
+ * Returns a REST endpoint's body in the public view context (empty array on failure).
+ *
+ * @param string $path REST path (without query string) to request.
+ * @return array The response data.
+ */
+function frontenberg_public_view_response( $path ) {
+	$request  = new WP_REST_Request( 'GET', $path );
+	$request->set_query_params( array( 'context' => 'view' ) );
+	$response = rest_do_request( $request );
+
+	if ( 200 !== $response->get_status() ) {
+		return array();
+	}
+
+	return rest_get_server()->response_to_data( rest_ensure_response( $response ), false );
+}
+
 add_action(
 	'template_redirect',
 	function() {
@@ -441,58 +734,6 @@ add_action(
 				wp_enqueue_style( 'admin-menu' );
 				wp_enqueue_style( 'admin-bar' );
 				wp_enqueue_style( 'l10n' );
-
-				if ( false ) {
-					return;
-				}
-
-				$post = get_post();
-
-				// Temporarily hardcode content
-				$temporary_content = include __DIR__ . '/gutenberg-content.php';
-
-				wp_add_inline_script(
-					'wp-api-fetch',
-					sprintf(
-						'wp.apiFetch.use( wp.apiFetch.createPreloadingMiddleware( %s ) );',
-						wp_json_encode(
-							array(
-								'/wp/v2/pages/' . $post->ID . '?context=edit' => array(
-									'body' => array(
-										'id'             => $post->ID,
-										'title'          => array( 'raw' => $temporary_content['title'] ),
-										'content'        => array(
-											'block_format' => 1,
-											'raw'          => $temporary_content['content'],
-										),
-										'excerpt'        => array( 'raw' => '' ),
-										'date'           => '',
-										'date_gmt'       => '',
-										'modified'       => '',
-										'modified_gmt'   => '',
-										'link'           => home_url( '/' ),
-										'guid'           => array(),
-										'parent'         => 0,
-										'menu_order'     => 0,
-										'author'         => 0,
-										'featured_media' => 0,
-										'comment_status' => 'closed',
-										'ping_status'    => 'closed',
-										'template'       => '',
-										'meta'           => array(),
-										'_links'         => array(),
-										'type'           => 'page',
-										'status'         => 'pending', // pending is the best state to remove draft saving possibilities.
-										'slug'           => '',
-										'generated_slug' => '',
-										'permalink_template' => home_url( '/' ),
-									),
-								),
-							)
-						)
-					),
-					'after'
-				);
 			},
 			11
 		);
