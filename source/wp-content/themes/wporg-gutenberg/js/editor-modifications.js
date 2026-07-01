@@ -14,14 +14,27 @@ _wpLoadBlockEditor.then( function () {
 	wp.blocks.unregisterBlockType( 'core/shortcode' );
 } );
 
+// Keep the URL on the front page: the editor's BrowserURL rewrites it to wp-admin's
+// post.php on mount, which would bounce a logged-out visitor to login on reload.
+const originalReplaceState = window.history.replaceState.bind( window.history );
+window.history.replaceState = function ( state, title, url ) {
+	if ( typeof url === 'string' && url.indexOf( 'post.php' ) !== -1 ) {
+		return;
+	}
+	return originalReplaceState( state, title, url );
+};
+
 // Use a middleware provider to intercept and modify API calls. Short-circuit POST requests, bound queries, allow media, etc.
 wp.apiFetch.use( function ( options, next ) {
 	const isWhitelistedEndpoint =
 		options.path.startsWith( '/oembed/1.0/proxy' ) ||
 		options.path.startsWith( '/gutenberg/v1/block-renderer' );
 
-	// Prevent non-whitelisted non-GET requests (ie. POST) to prevent errors
-	if ( options.method && options.method !== 'GET' && ! isWhitelistedEndpoint ) {
+	// Block writes to keep Frontenberg read-only, but let GET and OPTIONS through:
+	// OPTIONS are the editor's canUser() probes, which expect a Response (headers).
+	const method = ( options.method || 'GET' ).toUpperCase();
+	const isWrite = 'POST' === method || 'PUT' === method || 'PATCH' === method || 'DELETE' === method;
+	if ( isWrite && ! isWhitelistedEndpoint ) {
 		// This works in enough cases to be the default return value.
 		return Promise.resolve( options.data );
 	}
@@ -36,30 +49,6 @@ wp.apiFetch.use( function ( options, next ) {
 
 	return next( options );
 } );
-
-// Use a middleware preloader to handle the "types" API endpoints with minimal data needed
-wp.apiFetch.use(
-	wp.apiFetch.createPreloadingMiddleware( {
-		'/wp/v2/types?context=edit': {
-			body: {
-				page: {
-					rest_base: 'pages',
-					supports: {},
-					labels: {
-						singular_name: 'Page',
-					},
-				},
-				wp_block: {
-					rest_base: 'blocks',
-					supports: {},
-					labels: {
-						singular_name: 'Block',
-					},
-				},
-			},
-		},
-	} )
-);
 
 // Add a middleware provider which intercepts all uploads and stores them within the browser
 wp.apiFetch.use( function ( options, next ) {
